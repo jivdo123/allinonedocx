@@ -129,7 +129,7 @@ async def process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     input_files = context.user_data['files']
-    
+
     await update.message.reply_text(f"🔄 Starting processing for {len(input_files)} file(s)...")
 
     # --- STEP 1: FONT MODIFICATION (on all files first) ---
@@ -142,7 +142,7 @@ async def process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     valid_tables_to_clone = []
     rejected_table_count = 0
     unidentified_row_details = []
-    
+
     try:
         for file_path in input_files:
             logger.info(f"Validating tables in: {file_path}")
@@ -150,7 +150,7 @@ async def process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
             for table in doc.tables:
                 unidentified_rows_in_table = 0
-                
+
                 # First, validate the entire table
                 for row in table.rows:
                     identifier = row.cells[0].text.strip()
@@ -165,14 +165,14 @@ async def process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     rejected_table_count += 1
                 else:
                     valid_tables_to_clone.append(table)
-        
+
         # --- STEP 3: REPORTING ERRORS TO USER ---
         if unidentified_row_details:
             error_message = "⚠️ Found rows with unidentified identifiers:\n" + "\n".join(unidentified_row_details)
             await update.message.reply_text(error_message, parse_mode='Markdown')
-        
+
         if rejected_table_count > 0:
-            await update.message.reply_text(f"‼️ Rejected *{rejected_table_count} table(s) due to having 4 or more unidentified rows.", parse_mode='Markdown')
+            await update.message.reply_text(f"‼️ Rejected *{rejected_table_count} table(s)* due to having 4 or more unidentified rows.", parse_mode='Markdown')
 
         if not valid_tables_to_clone:
             await update.message.reply_text("ℹ️ No valid tables were found to process after validation.")
@@ -184,11 +184,11 @@ async def process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         file_counter = 1
         for i in range(0, len(valid_tables_to_clone), TABLES_PER_FILE):
             chunk = valid_tables_to_clone[i:i + TABLES_PER_FILE]
-            
+
             new_doc = docx.Document()
             new_doc.add_heading(f"Processed Tables - Part {file_counter}", level=1)
             new_doc.add_paragraph(f"This document contains {len(chunk)} of the {len(valid_tables_to_clone)} total valid tables.")
-            
+
             for table in chunk:
                 clone_table(table, new_doc)
 
@@ -196,7 +196,7 @@ async def process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             new_doc.save(output_filename)
             output_files.append(output_filename)
             file_counter += 1
-            
+
         await update.message.reply_text(f"✅ Processing complete! Sending you {len(output_files)} new file(s)...")
         for output_file in output_files:
             with open(output_file, 'rb') as f:
@@ -205,7 +205,7 @@ async def process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.error(f"Error during main processing for user {user_id}: {e}")
         await update.message.reply_text("❌ A critical error occurred during the main processing stage.")
-    
+
     finally:
         # --- FINAL STEP: CLEANUP ---
         logger.info(f"Cleaning up all temp files for user {user_id}")
@@ -229,7 +229,7 @@ def main() -> None:
         os.makedirs(DOWNLOAD_DIR)
 
     application = Application.builder().token(BOT_TOKEN).build()
-    
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("process", process))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -239,3 +239,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
