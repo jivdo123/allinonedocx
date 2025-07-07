@@ -1,18 +1,23 @@
 import os
-import logging
-import copy
 import re
+import io
+import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import docx
+from docx import Document
 from docx.shared import Pt
 
 # --- Configuration ---
-BOT_TOKEN = "8127720127:AAFeFVi4a2ZXmY-osUz9HjreJT4ZCfe4mtc"
-TABLES_PER_FILE = 30
-DOWNLOAD_DIR = "downloads"
+# --- Paste your bot token here ---
+TELEGRAM_BOT_TOKEN = '8112681572:AAHXFkLmUkwsRxcpx8GN0FCvd8gsnxFOk3I' 
 
-# --- Setup Logging ---
+# Number of questions to include in each generated DOCX file
+QUESTIONS_PER_FILE = 30
+# Official MIME type for .docx files, used for filtering
+DOCX_MIME_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+
+# --- Logging Setup ---
+# Enables logging to see errors and bot activity in the console
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -20,260 +25,267 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ==============================================================================
-# === GENERAL HELPER FUNCTIONS ===
-# ==============================================================================
+# --- Helper Functions ---
 
-def set_font_size_for_cell(cell, size_in_pt):
+def set_font_for_cell(cell, size_in_pt, is_bold=False):
+    """
+    Iterates through paragraphs and runs in a cell to set the font properties.
+    """
     for paragraph in cell.paragraphs:
         for run in paragraph.runs:
-            run.font.size = Pt(size_in_pt)
+            font = run.font
+            font.size = Pt(size_in_pt)
+            font.bold = is_bold
 
-def apply_font_modifications_to_table(table):
-    for row in table.rows:
-        identifier = row.cells[0].text.strip()
-        if identifier.lower() == 'question':
-            set_font_size_for_cell(row.cells[1], 14)
-        else:
-            set_font_size_for_cell(row.cells[1], 12)
-
-def clone_table(table, new_doc):
-    p = new_doc.add_paragraph()
-    tbl_xml = table._tbl
-    new_tbl_xml = copy.deepcopy(tbl_xml)
-    p._p.addnext(new_tbl_xml)
-    new_doc.add_paragraph()
-
-
-# ==============================================================================
-# === WORKFLOW 1: PROCESSING FILES WITH EXISTING TABLES (Corrected) ===
-# ==============================================================================
-
-def process_table_document(doc):
+def parse_text_question(block: str):
     """
-    Validates tables based on the specific cell check for 'incorrect'.
+    Parses a single block of text based on a fixed line structure.
     """
-    valid_tables = []
-    rejected_count = 0
+    block = block.strip()
+    if not block:
+        return None
+
+    lines = [line.strip() for line in block.split('\n') if line.strip()]
+
+    if len(lines) < 5:
+        raise ValueError("The question block is incomplete. It must have a question and at least four options.")
+
+    correct_option_match = re.search(r'Correct Option:\s*(\S+)', block, re.IGNORECASE)
+    if not correct_option_match:
+        raise ValueError("The 'Correct Option: [id]' line is missing.")
+    correct_option_id = correct_option_match.group(1).lower()
+
+    question_text = re.sub(r'^(?:\d+\.|Q\.)\s*', '', lines[0])
+
+    parsed_options = []
+    option_ids = ['a', 'b', 'c', 'd']
+    for i in range(4):
+        option_line = lines[i + 1]
+        option_text = re.sub(r'^[a-zA-Z\d]+[\.\)]\s*', '', option_line)
+        parsed_options.append({'id': option_ids[i], 'text': option_text})
     
-    for table in doc.tables:
-        is_rejected = False
-        # Rule: Check 3rd, 4th, 5th, and 6th rows (if they exist)
-        if len(table.rows) >= 6:
-            incorrect_markers = 0
-            # Rows to check are at index 2, 3, 4, 5
-            rows_to_check = table.rows[2:6]
-            for row in rows_to_check:
-                # Check the second column (index 1)
-                if len(row.cells) > 1 and 'incorrect' in row.cells[1].text.lower():
-                    incorrect_markers += 1
+    explanation_text = ""
+    if len(lines) > 5:
+        explanation_lines = []
+        for line in lines[5:]:
+            if 'Correct Option:' not in line:
+                explanation_lines.append(line)
+        explanation_text = "\n".join(explanation_lines).strip()
+
+    return {
+        'question_text': question_text,
+        'options': parsed_options,
+        'correct_option_id': correct_option_id,
+        'explanation_text': explanation_text
+    }
+
+
+def create_formatted_docx_stream(questions_data) -> io.BytesIO:
+    """
+    Generates a .docx file in memory with formatted tables for each question
+    and returns it as a byte stream.
+    """
+    doc = Document()
+    
+    for q_data in questions_data:
+        table = doc.add_table(rows=0, cols=3)
+        table.style = 'Table Grid'
+        
+        # --- 1. Question Row ---
+        row_cells = table.add_row().cells
+        row_cells[0].text = 'Question'
+        row_cells[1].merge(row_cells[2]).text = q_data['question_text']
+        set_font_for_cell(row_cells[1], 14) # Apply 14pt font
+
+        # --- 2. Type Row ---
+        row_cells = table.add_row().cells
+        row_cells[0].text = 'Type'
+        row_cells[1].merge(row_cells[2]).text = 'multiple_choice'
+
+        # --- 3. Option Rows ---
+        correct_id = q_data.get('correct_option_id')
+        correct_index = q_data.get('correct_option_index')
+
+        for i, option in enumerate(q_data['options']):
+            row_cells = table.add_row().cells
+            row_cells[0].text = 'Option'
+            row_cells[1].text = option['text']
+            set_font_for_cell(row_cells[1], 12) # Apply 12pt font
             
-            # Reject if all four specific cells contain 'incorrect'
-            if incorrect_markers == 4:
-                is_rejected = True
-        
-        if is_rejected:
-            rejected_count += 1
-        else:
-            valid_tables.append(table)
+            is_correct = False
+            if correct_id is not None:
+                if option.get('id', '').lower() == correct_id.lower():
+                    is_correct = True
+            elif correct_index is not None:
+                if i == correct_index:
+                    is_correct = True
             
-    report = f"Rejected {rejected_count} table(s) due to 4 'incorrect' markers in specified cells." if rejected_count > 0 else ""
-    return valid_tables, report
+            row_cells[2].text = 'correct' if is_correct else 'incorrect'
 
+        # --- 4. Solution Row ---
+        row_cells = table.add_row().cells
+        row_cells[0].text = 'Solution'
+        row_cells[1].merge(row_cells[2]).text = q_data['explanation_text']
+        set_font_for_cell(row_cells[1], 12) # Apply 12pt font
 
-# ==============================================================================
-# === WORKFLOW 2: PROCESSING FILES WITH PLAIN TEXT (Corrected) ===
-# ==============================================================================
+        # --- 5. Marks Row ---
+        row_cells = table.add_row().cells
+        row_cells[0].text = 'Marks'
+        row_cells[1].text = '4'
+        row_cells[2].text = '1'
 
-def process_text_document(doc):
-    """
-    Parses plain text, creating tables. The 'Explanation' field is now optional.
-    """
-    newly_created_tables = []
-    error_report_lines = []
-    
-    temp_doc = docx.Document()
-    paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-    
-    current_block = {}
-    line_number = 0
-
-    def create_table_from_block(block):
-        # Helper to create a table; ensures 'explanation' is handled if missing.
-        is_valid = all(k in block for k in ['question', 'options', 'correct']) and len(block['options']) == 4
-        if not is_valid:
-            error_report_lines.append(f"Skipped malformed block starting with: '{block.get('question', 'Unknown')[:30]}...'")
-            return None
-
-        table = temp_doc.add_table(rows=7, cols=2)
-        table.cell(0, 0).text = "Question"
-        table.cell(0, 1).text = block['question']
-        for i, opt in enumerate(block['options']):
-            table.cell(i + 1, 0).text = f"Option {chr(97 + i)}"
-            table.cell(i + 1, 1).text = opt
-        table.cell(5, 0).text = "Correct Option"
-        table.cell(5, 1).text = block['correct']
-        table.cell(6, 0).text = "Explanation"
-        table.cell(6, 1).text = block.get('explanation', '') # Use .get() for optional key
-        return table
-
-    while line_number < len(paragraphs):
-        line = paragraphs[line_number]
+        doc.add_paragraph('') # Add space between tables
         
-        match_q = re.match(r'^(?:Q\.|(?:\d{1,3}\.))\s*(.*)', line, re.IGNORECASE)
-        if match_q:
-            if current_block:
-                table = create_table_from_block(current_block)
-                if table: newly_created_tables.append(table)
-            current_block = {'question': match_q.group(1).strip(), 'options': []}
-        
-        elif 'question' in current_block:
-            match_opt = re.match(r'^[a-d]\.\s*(.*)', line, re.IGNORECASE)
-            match_correct = re.match(r'^Correct Option:\s*(.*)', line, re.IGNORECASE)
-            match_exp = re.match(r'^Explanation:\s*(.*)', line, re.IGNORECASE)
-
-            if match_opt and len(current_block.get('options', [])) < 4:
-                current_block['options'].append(match_opt.group(1).strip())
-            elif match_correct:
-                current_block['correct'] = match_correct.group(1).strip()
-            elif match_exp:
-                current_block['explanation'] = match_exp.group(1).strip()
-        
-        line_number += 1
-
-    # Process the very last block in the file
-    if current_block:
-        table = create_table_from_block(current_block)
-        if table: newly_created_tables.append(table)
-
-    report = "\n".join(error_report_lines)
-    return newly_created_tables, report
+    # Save the document to an in-memory stream
+    output_stream = io.BytesIO()
+    doc.save(output_stream)
+    output_stream.seek(0) # Rewind the stream to the beginning for reading
+    return output_stream
 
 
-# ==============================================================================
-# === TELEGRAM BOT HANDLERS ===
-# ==============================================================================
+# --- Telegram Bot Handlers ---
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_html(
-        "👋 **Welcome to the Final DOCX Bot!**\n\n"
-        "This version includes your latest corrections:\n"
-        "1️⃣ **Table Files**: Rejects tables if the 2nd column of rows 3, 4, 5, and 6 all contain 'incorrect'.\n"
-        "2️⃣ **Text Files**: `Explanation:` is now optional. If missing, the cell will be blank, and the block will NOT be an error.\n\n"
-        "<b>How to use:</b>\n"
-        "1. Send me your <code>.docx</code> files.\n"
-        "2. Use the <code>/process</code> command."
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for the /start command."""
+    await update.message.reply_text(
+        "Hello! 👋\n\n"
+        "Please send me a .txt or .docx file with your questions, or forward a Telegram Quiz.\n\n"
+        "I will convert them into a structured and formatted .docx file for you. "
+        f"If a file has more than {QUESTIONS_PER_FILE} questions, I'll create multiple documents."
     )
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.message
-    if not message.document or not message.document.file_name.endswith('.docx'):
-        await message.reply_text("⚠️ Please send only `.docx` files.")
-        return
-    user_id = message.from_user.id
-    if 'files' not in context.user_data:
-        context.user_data['files'] = []
-    try:
-        file = await message.document.get_file()
-        file_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{message.document.file_name}")
-        await file.download_to_drive(file_path)
-        context.user_data['files'].append(file_path)
-        logger.info(f"User {user_id} uploaded file: {file_path}")
-        await message.reply_text("✅ File received. Send more files or use <b>/process</b>.", parse_mode='HTML')
-    except Exception as e:
-        logger.error(f"Error handling document for user {user_id}: {e}")
-        await message.reply_text("An error occurred while receiving your file.")
 
-async def process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # This main orchestrator function remains the same.
-    user_id = update.message.from_user.id
-    if not context.user_data.get('files'):
-        await update.message.reply_text("You haven't sent any files yet.")
-        return
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles file uploads (.txt, .docx), extracts text, and creates formatted .docx files."""
+    doc_file = update.message.document
+    temp_file_path = None # To ensure cleanup happens
 
-    input_files = context.user_data['files']
-    await update.message.reply_text(f"🔄 Processing {len(input_files)} file(s) with the final logic...")
-
-    all_processed_tables = []
-    error_reports = []
-    output_files = []
-
-    try:
-        for file_path in input_files:
-            doc = docx.Document(file_path)
-            file_name = os.path.basename(file_path)
-            
-            if doc.tables:
-                logger.info(f"Processing '{file_name}' as a table-based document.")
-                valid_tables, report = process_table_document(doc)
-                all_processed_tables.extend(valid_tables)
-                if report: error_reports.append(f"In '{file_name}': {report}")
-            else:
-                logger.info(f"Processing '{file_name}' as a text-based document.")
-                new_tables, report = process_text_document(doc)
-                all_processed_tables.extend(new_tables)
-                if report: error_reports.append(f"In '{file_name}':\n{report}")
-
-        if error_reports:
-            await update.message.reply_text("⚠️ **Processing Report:**\n\n" + "\n\n".join(error_reports))
-        
-        if not all_processed_tables:
-            await update.message.reply_text("ℹ️ No valid tables could be found or created from your files.")
-            return
-
-        for table in all_processed_tables:
-            apply_font_modifications_to_table(table)
-
-        await update.message.reply_text(f"✅ Found/created {len(all_processed_tables)} valid tables. Creating final document(s)...")
-        for i in range(0, len(all_processed_tables), TABLES_PER_FILE):
-            chunk = all_processed_tables[i:i + TABLES_PER_FILE]
-            
-            new_doc = docx.Document()
-            new_doc.add_heading(f"Processed Tables - Part {i//TABLES_PER_FILE + 1}", level=1)
-            
-            for table in chunk:
-                clone_table(table, new_doc)
-
-            output_filename = os.path.join(DOWNLOAD_DIR, f"{user_id}_output_part_{i//TABLES_PER_FILE + 1}.docx")
-            new_doc.save(output_filename)
-            output_files.append(output_filename)
-            
-        for output_file in output_files:
-            with open(output_file, 'rb') as f:
-                await context.bot.send_document(chat_id=update.effective_chat.id, document=f)
-
-    except Exception as e:
-        logger.error(f"A critical error occurred: {e}", exc_info=True)
-        await update.message.reply_text("❌ A critical error occurred during processing.")
+    await update.message.reply_text(f"Processing your file: {doc_file.file_name} ... ⏳")
     
+    try:
+        # 1. Download the file from Telegram
+        temp_file_path = f'input_{doc_file.file_id}{os.path.splitext(doc_file.file_name)[1]}'
+        file = await doc_file.get_file()
+        await file.download_to_drive(temp_file_path)
+
+        # 2. Read the file content based on its type
+        content = ""
+        if doc_file.mime_type == 'text/plain':
+            with open(temp_file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        elif doc_file.mime_type == DOCX_MIME_TYPE:
+            doc = Document(temp_file_path)
+            content = "\n".join([p.text for p in doc.paragraphs])
+        else:
+            await update.message.reply_text(f"❌ Unsupported file type: {doc_file.mime_type}")
+            return
+            
+        # 3. Parse the extracted text content
+        question_blocks = re.split(r'\n\s*\n', content.strip())
+        valid_questions = []
+        failed_blocks = []
+
+        for i, block in enumerate(question_blocks):
+            if not block.strip(): continue
+            try:
+                parsed_q = parse_text_question(block)
+                if parsed_q:
+                    valid_questions.append(parsed_q)
+            except ValueError as e:
+                failed_blocks.append(f"❗️ ERROR IN QUESTION #{i+1}\nReason: {e}")
+
+        # 4. Report any parsing errors
+        if failed_blocks:
+            error_summary = "\n\n".join(failed_blocks)
+            await update.message.reply_text(f"Found some issues in your file:\n\n{error_summary}")
+
+        # 5. Process valid questions and create batched DOCX files
+        if valid_questions:
+            total_q = len(valid_questions)
+            num_files = (total_q + QUESTIONS_PER_FILE - 1) // QUESTIONS_PER_FILE
+            
+            await update.message.reply_text(
+                f"✅ Successfully parsed {total_q} question(s). "
+                f"Generating {num_files} formatted DOCX file(s) for you now..."
+            )
+            
+            # Split valid_questions into chunks
+            for i in range(0, total_q, QUESTIONS_PER_FILE):
+                chunk = valid_questions[i:i + QUESTIONS_PER_FILE]
+                part_num = (i // QUESTIONS_PER_FILE) + 1
+                
+                # Create formatted docx in memory
+                docx_stream = create_formatted_docx_stream(chunk)
+                
+                output_filename = f"Formatted_Questions_Part_{part_num}.docx"
+                await update.message.reply_document(document=docx_stream, filename=output_filename)
+                
+        elif not failed_blocks:
+            await update.message.reply_text("🤔 No valid questions found in the file.")
+
+    except Exception as e:
+        logger.error(f"An error occurred in handle_document: {e}")
+        await update.message.reply_text(f"🆘 An unexpected error occurred while processing your file.")
+        
     finally:
-        all_temp_files = input_files + output_files
-        for file_path in all_temp_files:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        context.user_data['files'] = []
+        # 6. Clean up the downloaded file
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
 
-# ==============================================================================
-# --- MAIN BOT EXECUTION ---
-# ==============================================================================
 
-def main() -> None:
-    if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
-        print("!!! ERROR: Please replace 'YOUR_TELEGRAM_BOT_TOKEN' with your actual bot token. !!!")
+async def handle_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles native Telegram quizzes."""
+    poll = update.message.poll
+    
+    if poll.type != 'quiz':
+        await update.message.reply_text("This is a regular poll, not a quiz. I can only process quizzes.")
         return
 
-    if not os.path.exists(DOWNLOAD_DIR):
-        os.makedirs(DOWNLOAD_DIR)
+    await update.message.reply_text("Processing quiz... ⏳")
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    try:
+        quiz_data = {
+            'question_text': poll.question,
+            'options': [{'text': opt.text} for opt in poll.options],
+            'correct_option_index': poll.correct_option_id,
+            'explanation_text': poll.explanation or ""
+        }
+
+        # Create the formatted docx in memory
+        docx_stream = create_formatted_docx_stream([quiz_data])
+        
+        await update.message.reply_text(f"✅ Quiz processed successfully!")
+        await update.message.reply_document(
+            document=docx_stream,
+            filename="Formatted_Quiz.docx"
+        )
+    except Exception as e:
+        logger.error(f"An error occurred in handle_quiz: {e}")
+        await update.message.reply_text("❌ Sorry, something went wrong while processing the quiz.")
+
+
+def main():
+    """Starts the bot and adds all handlers."""
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("process", process))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
-    print("Final Corrected DOCX Bot is running...")
+    
+    # This single handler now listens for both .txt and .docx files
+    combined_filter = filters.Document.TXT | filters.Document.MimeType(DOCX_MIME_TYPE)
+    application.add_handler(MessageHandler(combined_filter, handle_document))
+    
+    # Handler for quizzes
+    application.add_handler(MessageHandler(filters.POLL, handle_quiz))
+    
+    # Optional: Guide users who send plain text instead of files
+    async def guide_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("Please send your questions as a .txt or .docx file. I don't process plain text messages.")
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, guide_user))
+    
+    logger.info("Bot started... (Press Ctrl+C to stop)")
     application.run_polling()
+
 
 if __name__ == '__main__':
     main()
-                
+        
