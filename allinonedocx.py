@@ -1,19 +1,16 @@
 import os
 import logging
-import io
 import copy
+import re
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import docx
 from docx.shared import Pt
-from docx.oxml.shared import OxmlElement, qn
 
 # --- Configuration ---
-# PASTE YOUR TELEGRAM BOT TOKEN HERE
 BOT_TOKEN = "8127720127:AAFeFVi4a2ZXmY-osUz9HjreJT4ZCfe4mtc"
 TABLES_PER_FILE = 30
 DOWNLOAD_DIR = "downloads"
-VALID_ROW_IDENTIFIERS = ['Question', 'Option', 'Solution']
 
 # --- Setup Logging ---
 logging.basicConfig(
@@ -24,50 +21,23 @@ logger = logging.getLogger(__name__)
 
 
 # ==============================================================================
-# === FEATURE 1: FONT MODIFICATION LOGIC ===
+# === GENERAL HELPER FUNCTIONS ===
 # ==============================================================================
 
 def set_font_size_for_cell(cell, size_in_pt):
-    """Iterates through paragraphs and runs in a cell to set the font size."""
     for paragraph in cell.paragraphs:
         for run in paragraph.runs:
             run.font.size = Pt(size_in_pt)
 
-def apply_font_modifications_to_file(file_path: str) -> bool:
-    """
-    Opens a docx file from a path, modifies table font sizes based on rules,
-    and saves the changes back to the same file.
-    """
-    try:
-        document = docx.Document(file_path)
-        logger.info(f"Applying font modifications to: {os.path.basename(file_path)}")
-
-        for table in document.tables:
-            for row in table.rows:
-                row_identifier = row.cells[0].text.strip()
-                if row_identifier in VALID_ROW_IDENTIFIERS:
-                    if row_identifier == 'Question':
-                        set_font_size_for_cell(row.cells[1], 14)
-                    else: # Option and Solution
-                        set_font_size_for_cell(row.cells[1], 12)
-
-        document.save(file_path)
-        logger.info(f"Successfully saved font modifications for: {os.path.basename(file_path)}")
-        return True
-
-    except Exception as e:
-        logger.error(f"Error modifying DOCX file {file_path}: {e}")
-        return False
-
-
-# ==============================================================================
-# === FEATURE 2: ACCURATE TABLE CLONING LOGIC ===
-# ==============================================================================
+def apply_font_modifications_to_table(table):
+    for row in table.rows:
+        identifier = row.cells[0].text.strip()
+        if identifier.lower() == 'question':
+            set_font_size_for_cell(row.cells[1], 14)
+        else:
+            set_font_size_for_cell(row.cells[1], 12)
 
 def clone_table(table, new_doc):
-    """
-    Clones a table by copying its underlying XML element to preserve all formatting.
-    """
     p = new_doc.add_paragraph()
     tbl_xml = table._tbl
     new_tbl_xml = copy.deepcopy(tbl_xml)
@@ -76,140 +46,208 @@ def clone_table(table, new_doc):
 
 
 # ==============================================================================
+# === WORKFLOW 1: PROCESSING FILES WITH EXISTING TABLES (Corrected) ===
+# ==============================================================================
+
+def process_table_document(doc):
+    """
+    Validates tables based on the specific cell check for 'incorrect'.
+    """
+    valid_tables = []
+    rejected_count = 0
+    
+    for table in doc.tables:
+        is_rejected = False
+        # Rule: Check 3rd, 4th, 5th, and 6th rows (if they exist)
+        if len(table.rows) >= 6:
+            incorrect_markers = 0
+            # Rows to check are at index 2, 3, 4, 5
+            rows_to_check = table.rows[2:6]
+            for row in rows_to_check:
+                # Check the second column (index 1)
+                if len(row.cells) > 1 and 'incorrect' in row.cells[1].text.lower():
+                    incorrect_markers += 1
+            
+            # Reject if all four specific cells contain 'incorrect'
+            if incorrect_markers == 4:
+                is_rejected = True
+        
+        if is_rejected:
+            rejected_count += 1
+        else:
+            valid_tables.append(table)
+            
+    report = f"Rejected {rejected_count} table(s) due to 4 'incorrect' markers in specified cells." if rejected_count > 0 else ""
+    return valid_tables, report
+
+
+# ==============================================================================
+# === WORKFLOW 2: PROCESSING FILES WITH PLAIN TEXT (Corrected) ===
+# ==============================================================================
+
+def process_text_document(doc):
+    """
+    Parses plain text, creating tables. The 'Explanation' field is now optional.
+    """
+    newly_created_tables = []
+    error_report_lines = []
+    
+    temp_doc = docx.Document()
+    paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    
+    current_block = {}
+    line_number = 0
+
+    def create_table_from_block(block):
+        # Helper to create a table; ensures 'explanation' is handled if missing.
+        is_valid = all(k in block for k in ['question', 'options', 'correct']) and len(block['options']) == 4
+        if not is_valid:
+            error_report_lines.append(f"Skipped malformed block starting with: '{block.get('question', 'Unknown')[:30]}...'")
+            return None
+
+        table = temp_doc.add_table(rows=7, cols=2)
+        table.cell(0, 0).text = "Question"
+        table.cell(0, 1).text = block['question']
+        for i, opt in enumerate(block['options']):
+            table.cell(i + 1, 0).text = f"Option {chr(97 + i)}"
+            table.cell(i + 1, 1).text = opt
+        table.cell(5, 0).text = "Correct Option"
+        table.cell(5, 1).text = block['correct']
+        table.cell(6, 0).text = "Explanation"
+        table.cell(6, 1).text = block.get('explanation', '') # Use .get() for optional key
+        return table
+
+    while line_number < len(paragraphs):
+        line = paragraphs[line_number]
+        
+        match_q = re.match(r'^(?:Q\.|(?:\d{1,3}\.))\s*(.*)', line, re.IGNORECASE)
+        if match_q:
+            if current_block:
+                table = create_table_from_block(current_block)
+                if table: newly_created_tables.append(table)
+            current_block = {'question': match_q.group(1).strip(), 'options': []}
+        
+        elif 'question' in current_block:
+            match_opt = re.match(r'^[a-d]\.\s*(.*)', line, re.IGNORECASE)
+            match_correct = re.match(r'^Correct Option:\s*(.*)', line, re.IGNORECASE)
+            match_exp = re.match(r'^Explanation:\s*(.*)', line, re.IGNORECASE)
+
+            if match_opt and len(current_block.get('options', [])) < 4:
+                current_block['options'].append(match_opt.group(1).strip())
+            elif match_correct:
+                current_block['correct'] = match_correct.group(1).strip()
+            elif match_exp:
+                current_block['explanation'] = match_exp.group(1).strip()
+        
+        line_number += 1
+
+    # Process the very last block in the file
+    if current_block:
+        table = create_table_from_block(current_block)
+        if table: newly_created_tables.append(table)
+
+    report = "\n".join(error_report_lines)
+    return newly_created_tables, report
+
+
+# ==============================================================================
 # === TELEGRAM BOT HANDLERS ===
 # ==============================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message explaining all bot features, including error handling."""
     await update.message.reply_html(
-        "👋 **Welcome to the Advanced DOCX Processor Bot!**\n\n"
-        "I perform three main tasks:\n"
-        "1️⃣ **Validate & Report Errors**: I check each table. If a row doesn't start with 'Question', 'Option', or 'Solution', I will report it back to you. Tables with 4 or more such errors will be skipped entirely.\n"
-        "2️⃣ **Format Fonts**: I correctly format the font sizes for all valid rows.\n"
-        "3️⃣ **Combine Tables**: I extract all valid tables and combine them into new documents.\n\n"
+        "👋 **Welcome to the Final DOCX Bot!**\n\n"
+        "This version includes your latest corrections:\n"
+        "1️⃣ **Table Files**: Rejects tables if the 2nd column of rows 3, 4, 5, and 6 all contain 'incorrect'.\n"
+        "2️⃣ **Text Files**: `Explanation:` is now optional. If missing, the cell will be blank, and the block will NOT be an error.\n\n"
         "<b>How to use:</b>\n"
-        "1. Send me one or more <code>.docx</code> files.\n"
-        "2. Use the <code>/process</code> command to begin."
+        "1. Send me your <code>.docx</code> files.\n"
+        "2. Use the <code>/process</code> command."
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles receiving a document, saves it locally for processing."""
     message = update.message
     if not message.document or not message.document.file_name.endswith('.docx'):
         await message.reply_text("⚠️ Please send only `.docx` files.")
         return
-
     user_id = message.from_user.id
     if 'files' not in context.user_data:
         context.user_data['files'] = []
-
     try:
         file = await message.document.get_file()
         file_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{message.document.file_name}")
         await file.download_to_drive(file_path)
         context.user_data['files'].append(file_path)
         logger.info(f"User {user_id} uploaded file: {file_path}")
-
-        await message.reply_text(
-            "✅ File received.\n\n"
-            "You can send another file or use <b>/process</b> to validate, format, and combine everything.",
-            parse_mode='HTML'
-        )
+        await message.reply_text("✅ File received. Send more files or use <b>/process</b>.", parse_mode='HTML')
     except Exception as e:
         logger.error(f"Error handling document for user {user_id}: {e}")
-        await message.reply_text("An error occurred while receiving your file. Please try again.")
+        await message.reply_text("An error occurred while receiving your file.")
 
 async def process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Processes files: validates tables, reports errors, applies fonts, and extracts valid tables.
-    """
+    # This main orchestrator function remains the same.
     user_id = update.message.from_user.id
-    if 'files' not in context.user_data or not context.user_data['files']:
-        await update.message.reply_text("You haven't sent any files. Please send a `.docx` file first.")
+    if not context.user_data.get('files'):
+        await update.message.reply_text("You haven't sent any files yet.")
         return
 
     input_files = context.user_data['files']
+    await update.message.reply_text(f"🔄 Processing {len(input_files)} file(s) with the final logic...")
 
-    await update.message.reply_text(f"🔄 Starting processing for {len(input_files)} file(s)...")
-
-    # --- STEP 1: FONT MODIFICATION (on all files first) ---
-    for file_path in input_files:
-        if not apply_font_modifications_to_file(file_path):
-            await update.message.reply_text(f"❌ Critical error modifying fonts in {os.path.basename(file_path)}. Aborting.")
-            return
-
-    # --- STEP 2: VALIDATION AND TABLE GATHERING ---
-    valid_tables_to_clone = []
-    rejected_table_count = 0
-    unidentified_row_details = []
+    all_processed_tables = []
+    error_reports = []
+    output_files = []
 
     try:
         for file_path in input_files:
-            logger.info(f"Validating tables in: {file_path}")
             doc = docx.Document(file_path)
+            file_name = os.path.basename(file_path)
+            
+            if doc.tables:
+                logger.info(f"Processing '{file_name}' as a table-based document.")
+                valid_tables, report = process_table_document(doc)
+                all_processed_tables.extend(valid_tables)
+                if report: error_reports.append(f"In '{file_name}': {report}")
+            else:
+                logger.info(f"Processing '{file_name}' as a text-based document.")
+                new_tables, report = process_text_document(doc)
+                all_processed_tables.extend(new_tables)
+                if report: error_reports.append(f"In '{file_name}':\n{report}")
 
-            for table in doc.tables:
-                unidentified_rows_in_table = 0
-
-                # First, validate the entire table
-                for row in table.rows:
-                    identifier = row.cells[0].text.strip()
-                    if identifier not in VALID_ROW_IDENTIFIERS:
-                        unidentified_rows_in_table += 1
-                        # Collect details of the unidentified row for reporting
-                        row_text = f"'{row.cells[0].text.strip()}' | '{row.cells[1].text.strip()}'"
-                        unidentified_row_details.append(f"- In file `{os.path.basename(file_path)}`: {row_text}")
-
-                # Now, decide whether to reject or accept the table
-                if unidentified_rows_in_table >= 4:
-                    rejected_table_count += 1
-                else:
-                    valid_tables_to_clone.append(table)
-
-        # --- STEP 3: REPORTING ERRORS TO USER ---
-        if unidentified_row_details:
-            error_message = "⚠️ Found rows with unidentified identifiers:\n" + "\n".join(unidentified_row_details)
-            await update.message.reply_text(error_message, parse_mode='Markdown')
-
-        if rejected_table_count > 0:
-            await update.message.reply_text(f"‼️ Rejected *{rejected_table_count} table(s)* due to having 4 or more unidentified rows.", parse_mode='Markdown')
-
-        if not valid_tables_to_clone:
-            await update.message.reply_text("ℹ️ No valid tables were found to process after validation.")
+        if error_reports:
+            await update.message.reply_text("⚠️ **Processing Report:**\n\n" + "\n\n".join(error_reports))
+        
+        if not all_processed_tables:
+            await update.message.reply_text("ℹ️ No valid tables could be found or created from your files.")
             return
 
-        # --- STEP 4: CREATE NEW DOCS FROM VALID TABLES ---
-        await update.message.reply_text(f"✅ Validation complete. Now creating new documents from {len(valid_tables_to_clone)} valid tables...")
-        output_files = []
-        file_counter = 1
-        for i in range(0, len(valid_tables_to_clone), TABLES_PER_FILE):
-            chunk = valid_tables_to_clone[i:i + TABLES_PER_FILE]
+        for table in all_processed_tables:
+            apply_font_modifications_to_table(table)
 
+        await update.message.reply_text(f"✅ Found/created {len(all_processed_tables)} valid tables. Creating final document(s)...")
+        for i in range(0, len(all_processed_tables), TABLES_PER_FILE):
+            chunk = all_processed_tables[i:i + TABLES_PER_FILE]
+            
             new_doc = docx.Document()
-            new_doc.add_heading(f"Processed Tables - Part {file_counter}", level=1)
-            new_doc.add_paragraph(f"This document contains {len(chunk)} of the {len(valid_tables_to_clone)} total valid tables.")
-
+            new_doc.add_heading(f"Processed Tables - Part {i//TABLES_PER_FILE + 1}", level=1)
+            
             for table in chunk:
                 clone_table(table, new_doc)
 
-            output_filename = os.path.join(DOWNLOAD_DIR, f"{user_id}_output_part_{file_counter}.docx")
+            output_filename = os.path.join(DOWNLOAD_DIR, f"{user_id}_output_part_{i//TABLES_PER_FILE + 1}.docx")
             new_doc.save(output_filename)
             output_files.append(output_filename)
-            file_counter += 1
-
-        await update.message.reply_text(f"✅ Processing complete! Sending you {len(output_files)} new file(s)...")
+            
         for output_file in output_files:
             with open(output_file, 'rb') as f:
                 await context.bot.send_document(chat_id=update.effective_chat.id, document=f)
 
     except Exception as e:
-        logger.error(f"Error during main processing for user {user_id}: {e}")
-        await update.message.reply_text("❌ A critical error occurred during the main processing stage.")
-
+        logger.error(f"A critical error occurred: {e}", exc_info=True)
+        await update.message.reply_text("❌ A critical error occurred during processing.")
+    
     finally:
-        # --- FINAL STEP: CLEANUP ---
-        logger.info(f"Cleaning up all temp files for user {user_id}")
-        all_temp_files = input_files + locals().get('output_files', [])
+        all_temp_files = input_files + output_files
         for file_path in all_temp_files:
             if os.path.exists(file_path):
                 os.remove(file_path)
@@ -220,7 +258,6 @@ async def process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ==============================================================================
 
 def main() -> None:
-    """Start the bot."""
     if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
         print("!!! ERROR: Please replace 'YOUR_TELEGRAM_BOT_TOKEN' with your actual bot token. !!!")
         return
@@ -229,14 +266,14 @@ def main() -> None:
         os.makedirs(DOWNLOAD_DIR)
 
     application = Application.builder().token(BOT_TOKEN).build()
-
+    
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("process", process))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    print("Advanced DOCX Processor Bot is running...")
+    print("Final Corrected DOCX Bot is running...")
     application.run_polling()
 
 if __name__ == '__main__':
     main()
-
+                
