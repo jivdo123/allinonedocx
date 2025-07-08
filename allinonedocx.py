@@ -1,77 +1,48 @@
 import os
-import re
 import io
+import re
+import copy
 import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from docx import Document
+import docx
 from docx.shared import Pt
 
 # --- Configuration ---
-# --- Paste your bot token here ---
-TELEGRAM_BOT_TOKEN = '8112681572:AAHXFkLmUkwsRxcpx8GN0FCvd8gsnxFOk3I' 
+BOT_TOKEN = "8127720127:AAFeFVi4a2ZXmY-osUz9HjreJT4ZCfe4mtc" # <-- PASTE YOUR REAL TOKEN
+TABLES_PER_FILE = 30
+DOWNLOAD_DIR = "downloads"
 
-# Number of questions to include in each generated DOCX file
-QUESTIONS_PER_FILE = 30
-# Official MIME type for .docx files, used for filtering
-DOCX_MIME_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-
-# --- Logging Setup ---
-# Enables logging to see errors and bot activity in the console
+# --- Setup Logging ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# =====================================================================
+# === HELPER & LOGIC FUNCTIONS (Unchanged) ===
+# =====================================================================
 
-# --- Helper Functions ---
-
-def set_font_for_cell(cell, size_in_pt, is_bold=False):
-    """
-    Iterates through paragraphs and runs in a cell to set the font properties.
-    """
-    for paragraph in cell.paragraphs:
-        for run in paragraph.runs:
-            font = run.font
-            font.size = Pt(size_in_pt)
-            font.bold = is_bold
-
-def parse_text_question(block: str):
-    """
-    Parses a single block of text based on a fixed line structure.
-    """
+def parse_individual_question(block: str):
     block = block.strip()
     if not block:
         return None
-
     lines = [line.strip() for line in block.split('\n') if line.strip()]
-
     if len(lines) < 5:
-        raise ValueError("The question block is incomplete. It must have a question and at least four options.")
-
+        raise ValueError("Incomplete block: must have a question and four options.")
     correct_option_match = re.search(r'Correct Option:\s*(\S+)', block, re.IGNORECASE)
     if not correct_option_match:
-        raise ValueError("The 'Correct Option: [id]' line is missing.")
+        raise ValueError("Missing 'Correct Option: [id]' line.")
     correct_option_id = correct_option_match.group(1).lower()
-
     question_text = re.sub(r'^(?:\d+\.|Q\.)\s*', '', lines[0])
-
     parsed_options = []
     option_ids = ['a', 'b', 'c', 'd']
     for i in range(4):
-        option_line = lines[i + 1]
-        option_text = re.sub(r'^[a-zA-Z\d]+[\.\)]\s*', '', option_line)
+        option_text = re.sub(r'^[a-zA-Z\d]+[\.\)]\s*', '', lines[i + 1])
         parsed_options.append({'id': option_ids[i], 'text': option_text})
-    
-    explanation_text = ""
-    if len(lines) > 5:
-        explanation_lines = []
-        for line in lines[5:]:
-            if 'Correct Option:' not in line:
-                explanation_lines.append(line)
-        explanation_text = "\n".join(explanation_lines).strip()
-
+    explanation_lines = [line for line in lines[5:] if 'Correct Option:' not in line]
+    explanation_text = "\n".join(explanation_lines).strip()
     return {
         'question_text': question_text,
         'options': parsed_options,
@@ -79,213 +50,212 @@ def parse_text_question(block: str):
         'explanation_text': explanation_text
     }
 
+def format_tables_in_doc(document: docx.Document):
+    logger.info(f"Formatting fonts for {len(document.tables)} tables.")
+    for table in document.tables:
+        for row in table.rows:
+            row_identifier = row.cells[0].text.strip()
+            target_cell = row.cells[1] if len(row.cells) > 1 else None
+            if not target_cell: continue
+            font_size = None
+            if row_identifier == 'Question': font_size = 14
+            elif row_identifier in ['Option', 'Solution']: font_size = 12
+            if font_size:
+                for paragraph in target_cell.paragraphs:
+                    for run in paragraph.runs:
+                        run.font.size = Pt(font_size)
 
-def create_formatted_docx_stream(questions_data) -> io.BytesIO:
+def clone_table(table, new_doc):
+    p = new_doc.add_paragraph()
+    p._p.addnext(copy.deepcopy(table._tbl))
+    new_doc.add_paragraph()
+
+# =====================================================================
+# === NEW & MODIFIED FUNCTIONS FOR THE FEATURE ===
+# =====================================================================
+
+async def create_docx_from_text(text_content: str) -> tuple[io.BytesIO | None, list[str]]:
     """
-    Generates a .docx file in memory with formatted tables for each question
-    and returns it as a byte stream.
+    NEW REFACTORED FUNCTION: Takes a string of text, processes it, creates a 
+    formatted docx file, and returns it as a stream along with any errors.
     """
-    doc = Document()
+    question_blocks = re.split(r'\n\s*\n', text_content.strip())
+    valid_questions, failed_blocks = [], []
+
+    for i, block in enumerate(question_blocks):
+        if not block.strip(): continue
+        try:
+            parsed_data = parse_individual_question(block)
+            if parsed_data: valid_questions.append(parsed_data)
+        except ValueError as e:
+            failed_blocks.append(f"❗️<b>Error in Question #{i+1}:</b> {e}\n<pre>{block}</pre>")
     
-    for q_data in questions_data:
-        table = doc.add_table(rows=0, cols=3)
-        table.style = 'Table Grid'
+    if not valid_questions:
+        return None, failed_blocks
+
+    try:
+        new_doc = docx.Document()
+        for q_data in valid_questions:
+            table = new_doc.add_table(rows=0, cols=3, style='Table Grid')
+            row_cells = table.add_row().cells; row_cells[0].text = 'Question'; row_cells[1].merge(row_cells[2]).text = q_data['question_text']
+            row_cells = table.add_row().cells; row_cells[0].text = 'Type'; row_cells[1].merge(row_cells[2]).text = 'multiple_choice'
+            for option in q_data['options']:
+                row_cells = table.add_row().cells; row_cells[0].text = 'Option'; row_cells[1].text = option['text']
+                row_cells[2].text = 'correct' if option['id'] == q_data['correct_option_id'] else 'incorrect'
+            row_cells = table.add_row().cells; row_cells[0].text = 'Solution'; row_cells[1].merge(row_cells[2]).text = q_data['explanation_text']
+            row_cells = table.add_row().cells; row_cells[0].text = 'Marks'; row_cells[1].text = '4'; row_cells[2].text = '1'
+            new_doc.add_paragraph('')
         
-        # --- 1. Question Row ---
-        row_cells = table.add_row().cells
-        row_cells[0].text = 'Question'
-        row_cells[1].merge(row_cells[2]).text = q_data['question_text']
-        set_font_for_cell(row_cells[1], 14) # Apply 14pt font
+        format_tables_in_doc(new_doc)
 
-        # --- 2. Type Row ---
-        row_cells = table.add_row().cells
-        row_cells[0].text = 'Type'
-        row_cells[1].merge(row_cells[2]).text = 'multiple_choice'
+        output_stream = io.BytesIO()
+        new_doc.save(output_stream)
+        output_stream.seek(0)
+        return output_stream, failed_blocks
+    except Exception as e:
+        logger.error(f"Error during DOCX creation from text: {e}")
+        failed_blocks.append(f"❌ A critical error occurred while generating the document: {e}")
+        return None, failed_blocks
 
-        # --- 3. Option Rows ---
-        correct_id = q_data.get('correct_option_id')
-        correct_index = q_data.get('correct_option_index')
+# =====================================================================
+# === TELEGRAM HANDLERS (MODIFIED) ===
+# =====================================================================
 
-        for i, option in enumerate(q_data['options']):
-            row_cells = table.add_row().cells
-            row_cells[0].text = 'Option'
-            row_cells[1].text = option['text']
-            set_font_for_cell(row_cells[1], 12) # Apply 12pt font
-            
-            is_correct = False
-            if correct_id is not None:
-                if option.get('id', '').lower() == correct_id.lower():
-                    is_correct = True
-            elif correct_index is not None:
-                if i == correct_index:
-                    is_correct = True
-            
-            row_cells[2].text = 'correct' if is_correct else 'incorrect'
-
-        # --- 4. Solution Row ---
-        row_cells = table.add_row().cells
-        row_cells[0].text = 'Solution'
-        row_cells[1].merge(row_cells[2]).text = q_data['explanation_text']
-        set_font_for_cell(row_cells[1], 12) # Apply 12pt font
-
-        # --- 5. Marks Row ---
-        row_cells = table.add_row().cells
-        row_cells[0].text = 'Marks'
-        row_cells[1].text = '4'
-        row_cells[2].text = '1'
-
-        doc.add_paragraph('') # Add space between tables
-        
-    # Save the document to an in-memory stream
-    output_stream = io.BytesIO()
-    doc.save(output_stream)
-    output_stream.seek(0) # Rewind the stream to the beginning for reading
-    return output_stream
-
-
-# --- Telegram Bot Handlers ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for the /start command."""
-    await update.message.reply_text(
-        "Hello! 👋\n\n"
-        "Please send me a .txt or .docx file with your questions, or forward a Telegram Quiz.\n\n"
-        "I will convert them into a structured and formatted .docx file for you. "
-        f"If a file has more than {QUESTIONS_PER_FILE} questions, I'll create multiple documents."
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """MODIFIED: Sends a welcome message explaining the new, smarter functionality."""
+    await update.message.reply_html(
+        "👋 <b>Welcome to the All-in-One Docx Bot!</b>\n\n"
+        "I can help you in a few ways:\n\n"
+        "1️⃣ <b>Send Plain Text:</b> Paste your questions directly into the chat, and I'll create a formatted .docx file for you.\n\n"
+        "2️⃣ <b>Send a .docx File:</b> I will automatically inspect your file.\n"
+        "   - If it contains <i>plain text</i>, I'll convert it to a table-based document immediately.\n"
+        "   - If it contains <i>tables</i>, I'll add it to a queue. Send more files with tables, then use <code>/convert</code> to merge them all!"
     )
 
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """MODIFIED: This now uses the new refactored function."""
+    user_text = update.message.text
+    await update.message.reply_text("🔄 Processing your text...")
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles file uploads (.txt, .docx), extracts text, and creates formatted .docx files."""
-    doc_file = update.message.document
-    temp_file_path = None # To ensure cleanup happens
+    output_stream, failed_blocks = await create_docx_from_text(user_text)
 
-    await update.message.reply_text(f"Processing your file: {doc_file.file_name} ... ⏳")
-    
-    try:
-        # 1. Download the file from Telegram
-        temp_file_path = f'input_{doc_file.file_id}{os.path.splitext(doc_file.file_name)[1]}'
-        file = await doc_file.get_file()
-        await file.download_to_drive(temp_file_path)
+    if failed_blocks:
+        await update.message.reply_html("Some parts of your text could not be processed:\n\n" + "\n\n".join(failed_blocks))
 
-        # 2. Read the file content based on its type
-        content = ""
-        if doc_file.mime_type == 'text/plain':
-            with open(temp_file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-        elif doc_file.mime_type == DOCX_MIME_TYPE:
-            doc = Document(temp_file_path)
-            content = "\n".join([p.text for p in doc.paragraphs])
-        else:
-            await update.message.reply_text(f"❌ Unsupported file type: {doc_file.mime_type}")
-            return
-            
-        # 3. Parse the extracted text content
-        question_blocks = re.split(r'\n\s*\n', content.strip())
-        valid_questions = []
-        failed_blocks = []
+    if output_stream:
+        await update.message.reply_document(document=output_stream, filename="formatted_from_text.docx")
+        logger.info("Successfully sent docx created from plain text message.")
 
-        for i, block in enumerate(question_blocks):
-            if not block.strip(): continue
-            try:
-                parsed_q = parse_text_question(block)
-                if parsed_q:
-                    valid_questions.append(parsed_q)
-            except ValueError as e:
-                failed_blocks.append(f"❗️ ERROR IN QUESTION #{i+1}\nReason: {e}")
-
-        # 4. Report any parsing errors
-        if failed_blocks:
-            error_summary = "\n\n".join(failed_blocks)
-            await update.message.reply_text(f"Found some issues in your file:\n\n{error_summary}")
-
-        # 5. Process valid questions and create batched DOCX files
-        if valid_questions:
-            total_q = len(valid_questions)
-            num_files = (total_q + QUESTIONS_PER_FILE - 1) // QUESTIONS_PER_FILE
-            
-            await update.message.reply_text(
-                f"✅ Successfully parsed {total_q} question(s). "
-                f"Generating {num_files} formatted DOCX file(s) for you now..."
-            )
-            
-            # Split valid_questions into chunks
-            for i in range(0, total_q, QUESTIONS_PER_FILE):
-                chunk = valid_questions[i:i + QUESTIONS_PER_FILE]
-                part_num = (i // QUESTIONS_PER_FILE) + 1
-                
-                # Create formatted docx in memory
-                docx_stream = create_formatted_docx_stream(chunk)
-                
-                output_filename = f"Formatted_Questions_Part_{part_num}.docx"
-                await update.message.reply_document(document=docx_stream, filename=output_filename)
-                
-        elif not failed_blocks:
-            await update.message.reply_text("🤔 No valid questions found in the file.")
-
-    except Exception as e:
-        logger.error(f"An error occurred in handle_document: {e}")
-        await update.message.reply_text(f"🆘 An unexpected error occurred while processing your file.")
-        
-    finally:
-        # 6. Clean up the downloaded file
-        if temp_file_path and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-
-
-async def handle_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles native Telegram quizzes."""
-    poll = update.message.poll
-    
-    if poll.type != 'quiz':
-        await update.message.reply_text("This is a regular poll, not a quiz. I can only process quizzes.")
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    HEAVILY MODIFIED: This function now inspects the docx file and decides which
+    workflow to trigger (merge vs. text conversion).
+    """
+    if not update.message.document or not update.message.document.file_name.endswith('.docx'):
+        await update.message.reply_text("⚠️ Please send only `.docx` files.")
         return
 
-    await update.message.reply_text("Processing quiz... ⏳")
+    await update.message.reply_text("Inspecting your .docx file...")
+    doc_file = await update.message.document.get_file()
+    
+    in_memory_stream = io.BytesIO()
+    await doc_file.download_to_memory(in_memory_stream)
+    in_memory_stream.seek(0)
 
     try:
-        quiz_data = {
-            'question_text': poll.question,
-            'options': [{'text': opt.text} for opt in poll.options],
-            'correct_option_index': poll.correct_option_id,
-            'explanation_text': poll.explanation or ""
-        }
+        document = docx.Document(in_memory_stream)
 
-        # Create the formatted docx in memory
-        docx_stream = create_formatted_docx_stream([quiz_data])
-        
-        await update.message.reply_text(f"✅ Quiz processed successfully!")
-        await update.message.reply_document(
-            document=docx_stream,
-            filename="Formatted_Quiz.docx"
-        )
+        # DECISION POINT: Does the document contain tables?
+        if document.tables:
+            # WORKFLOW 1: File has tables, save for merging.
+            logger.info("Document has tables. Adding to merge queue.")
+            user_id = update.message.from_user.id
+            if 'files' not in context.user_data: context.user_data['files'] = []
+            
+            file_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{doc_file.file_id}.docx")
+            with open(file_path, 'wb') as f:
+                f.write(in_memory_stream.getbuffer())
+            
+            context.user_data['files'].append(file_path)
+            await update.message.reply_html("✅ File contains tables and has been added to the queue. Send more files or use <code>/convert</code> to merge.")
+        else:
+            # WORKFLOW 2: File has NO tables, so process its text content now.
+            logger.info("Document has no tables. Processing its text content.")
+            full_text = "\n".join([p.text for p in document.paragraphs if p.text.strip()])
+
+            if not full_text:
+                await update.message.reply_text("This .docx file appears to be empty or contains no text.")
+                return
+
+            await update.message.reply_text("Found plain text. Attempting to convert it into a formatted document...")
+            output_stream, failed_blocks = await create_docx_from_text(full_text)
+            
+            if failed_blocks:
+                await update.message.reply_html("Could not process the text from your document:\n\n" + "\n\n".join(failed_blocks))
+            if output_stream:
+                await update.message.reply_document(document=output_stream, filename=f"formatted_{update.message.document.file_name}")
+                logger.info("Successfully sent docx created from docx text content.")
+
     except Exception as e:
-        logger.error(f"An error occurred in handle_quiz: {e}")
-        await update.message.reply_text("❌ Sorry, something went wrong while processing the quiz.")
+        logger.error(f"Error processing document file: {e}")
+        await update.message.reply_text("❌ An error occurred while processing your .docx file. It might be corrupted.")
 
+# --- Unchanged convert_command and main function ---
+async def convert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.from_user.id
+    input_files = context.user_data.get('files', [])
+    if not input_files:
+        await update.message.reply_text("You haven't added any files with tables to the queue yet.")
+        return
 
-def main():
-    """Starts the bot and adds all handlers."""
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    
-    # This single handler now listens for both .txt and .docx files
-    combined_filter = filters.Document.TXT | filters.Document.MimeType(DOCX_MIME_TYPE)
-    application.add_handler(MessageHandler(combined_filter, handle_document))
-    
-    # Handler for quizzes
-    application.add_handler(MessageHandler(filters.POLL, handle_quiz))
-    
-    # Optional: Guide users who send plain text instead of files
-    async def guide_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("Please send your questions as a .txt or .docx file. I don't process plain text messages.")
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, guide_user))
-    
-    logger.info("Bot started... (Press Ctrl+C to stop)")
+    await update.message.reply_text(f"🔄 Processing {len(input_files)} file(s) from the queue...")
+    all_tables, output_files = [], []
+    try:
+        for file_path in input_files:
+            doc = docx.Document(file_path)
+            all_tables.extend(doc.tables)
+        if not all_tables:
+            await update.message.reply_text("ℹ️ No tables were found in the queued document(s).")
+            return
+
+        for i in range(0, len(all_tables), TABLES_PER_FILE):
+            chunk = all_tables[i:i + TABLES_PER_FILE]
+            new_doc = docx.Document()
+            new_doc.add_heading(f"Merged Tables - Part {len(output_files) + 1}", 0)
+            for table in chunk: clone_table(table, new_doc)
+            format_tables_in_doc(new_doc)
+            output_filename = os.path.join(DOWNLOAD_DIR, f"{user_id}_merged_part_{len(output_files) + 1}.docx")
+            new_doc.save(output_filename)
+            output_files.append(output_filename)
+
+        await update.message.reply_text(f"✅ Conversion complete! Found {len(all_tables)} tables. Sending you {len(output_files)} new file(s)...")
+        for output_file in output_files:
+            with open(output_file, 'rb') as f:
+                await context.bot.send_document(chat_id=update.effective_chat.id, document=f)
+    except Exception as e:
+        logger.error(f"Error during conversion for user {user_id}: {e}")
+        await update.message.reply_text("❌ An error occurred during the conversion process.")
+    finally:
+        logger.info(f"Cleaning up files for user {user_id}")
+        for file_path in input_files + output_files:
+            if os.path.exists(file_path): os.remove(file_path)
+        context.user_data['files'] = []
+
+def main() -> None:
+    if "YOUR_TELEGRAM_BOT_TOKEN_HERE" in BOT_TOKEN:
+        print("!!! ERROR: Please paste your real Telegram bot token in the BOT_TOKEN variable. !!!")
+        return
+    if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
+
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("convert", convert_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    print("Unified All-in-One Bot is running...")
     application.run_polling()
-
 
 if __name__ == '__main__':
     main()
-        
+    
