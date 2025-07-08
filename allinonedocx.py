@@ -181,7 +181,7 @@ def create_output_docs(data_list, chat_id):
         table.style = 'Table Grid'
         
         # --- Column 1: Static Labels ---
-        static_labels = ["Question", "type", "Option", "Option", "Option", "Option", "Solution", "Marks"]
+        static_labels = ["Question", "Type", "Option", "Option", "Option", "Option", "Solution", "Marks"]
         for row_idx, label in enumerate(static_labels):
             table.cell(row_idx, 0).text = label
 
