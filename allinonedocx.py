@@ -9,7 +9,7 @@ from docx.shared import Pt
 # --- Configuration ---
 # IMPORTANT: Replace "YOUR_TELEGRAM_BOT_TOKEN" with your actual bot token.
 # It is highly recommended to use environment variables for security.
-TELEGRAM_BOT_TOKEN = "8127720127:AAFeFVi4a2ZXmY-osUz9HjreJT4ZCfe4mtc" 
+TELEGRAM_BOT_TOKEN = "8127720127:AAFeFVi4a2ZXmY-osUz9HjreJT4ZCfe4mtc"
 TEMP_DIR = "temp_docx_files"
 MAX_TABLES_PER_FILE = 30
 
@@ -79,10 +79,20 @@ def parse_plain_text_file(file_path):
                 continue
             correct_id = match.group(1).lower()
 
-            # Extract Explanation (optional)
-            explanation = ''
-            if len(lines) > 6 and lines[6].lower().startswith('explanation:'):
-                explanation = re.sub(r'^explanation:\s*', '', lines[6], flags=re.IGNORECASE)
+            # --- MODIFIED LOGIC FOR MULTI-LINE EXPLANATION ---
+            explanation = ""
+            # Check if there are any lines after the "Correct Option" line.
+            if len(lines) > 6:
+                # The rest of the lines belong to the explanation.
+                explanation_lines = lines[6:]
+                
+                # The first line of the explanation might have the "Explanation:" prefix. Remove it.
+                if explanation_lines and explanation_lines[0].lower().startswith('explanation:'):
+                    explanation_lines[0] = re.sub(r'^explanation:\s*', '', explanation_lines[0], flags=re.IGNORECASE).strip()
+                
+                # Join the lines (including the modified first line) to form the full explanation.
+                explanation = "\n".join(explanation_lines)
+            # --- END OF MODIFIED LOGIC ---
 
             extracted_data.append({
                 "question": question_text,
@@ -250,6 +260,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   d. 6\n"
         "   Correct Option: b\n"
         "   Explanation: This is an optional explanation.\n"
+        "   It can even span multiple lines.\n"
         "3. Send the file to me. I will process it instantly.\n\n"
         "🔹 **Workflow 2: Merge & Reformat Existing Tables**\n"
         "1. Send me one or more `.docx` files that already contain question tables.\n"
@@ -391,4 +402,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
+            
